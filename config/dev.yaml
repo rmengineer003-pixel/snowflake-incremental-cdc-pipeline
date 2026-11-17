@@ -1,1 +1,8 @@
-placeholder
+# Non-secret settings only. Credentials come from environment variables.
+env: DEV
+database: DEV_CUSTOMER_DB
+warehouse: DEV_TRANSFORM_WH
+monthly_credit_quota: 20
+stage_url: s3://example-bucket/customer-changes/   # placeholder
+storage_integration: EXAMPLE_S3_INTEGRATION         # placeholder, created by an admin
+task_schedule: 5 MINUTE
