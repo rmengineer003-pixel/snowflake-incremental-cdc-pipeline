@@ -1,1 +1,136 @@
-placeholder
+-- ===== 00_platform_rbac.sql =====
+-- Warehouse, cost guardrail, and least-privilege roles. Run as SYSADMIN / SECURITYADMIN.
+-- Placeholders are filled by sf_cdc.render from config/dev.yaml.
+
+CREATE WAREHOUSE IF NOT EXISTS DEV_TRANSFORM_WH
+  WAREHOUSE_SIZE = XSMALL AUTO_SUSPEND = 60 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE;
+
+CREATE RESOURCE MONITOR IF NOT EXISTS DEV_TRANSFORM_WH_RM
+  WITH CREDIT_QUOTA = 20 FREQUENCY = MONTHLY START_TIMESTAMP = IMMEDIATELY
+  TRIGGERS ON 80 PERCENT DO NOTIFY
+           ON 100 PERCENT DO SUSPEND;
+ALTER WAREHOUSE DEV_TRANSFORM_WH SET RESOURCE_MONITOR = DEV_TRANSFORM_WH_RM;
+
+CREATE DATABASE IF NOT EXISTS DEV_CUSTOMER_DB;
+CREATE SCHEMA IF NOT EXISTS DEV_CUSTOMER_DB.RAW;
+CREATE SCHEMA IF NOT EXISTS DEV_CUSTOMER_DB.CORE;
+
+CREATE ROLE IF NOT EXISTS DEV_LOADER;       -- Snowpipe / COPY INTO only
+CREATE ROLE IF NOT EXISTS DEV_TRANSFORMER;  -- streams, tasks, MERGE
+CREATE ROLE IF NOT EXISTS DEV_ANALYST;      -- read CORE only
+
+GRANT USAGE ON WAREHOUSE DEV_TRANSFORM_WH TO ROLE DEV_LOADER;
+GRANT USAGE ON WAREHOUSE DEV_TRANSFORM_WH TO ROLE DEV_TRANSFORMER;
+GRANT USAGE ON WAREHOUSE DEV_TRANSFORM_WH TO ROLE DEV_ANALYST;
+GRANT USAGE ON DATABASE DEV_CUSTOMER_DB TO ROLE DEV_LOADER;
+GRANT USAGE ON DATABASE DEV_CUSTOMER_DB TO ROLE DEV_TRANSFORMER;
+GRANT USAGE ON DATABASE DEV_CUSTOMER_DB TO ROLE DEV_ANALYST;
+
+GRANT USAGE ON SCHEMA DEV_CUSTOMER_DB.RAW TO ROLE DEV_LOADER;
+GRANT INSERT, SELECT ON FUTURE TABLES IN SCHEMA DEV_CUSTOMER_DB.RAW TO ROLE DEV_LOADER;
+
+GRANT USAGE ON SCHEMA DEV_CUSTOMER_DB.RAW TO ROLE DEV_TRANSFORMER;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA DEV_CUSTOMER_DB.RAW TO ROLE DEV_TRANSFORMER;
+GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STREAM, CREATE TASK ON SCHEMA DEV_CUSTOMER_DB.CORE TO ROLE DEV_TRANSFORMER;
+
+GRANT USAGE ON SCHEMA DEV_CUSTOMER_DB.CORE TO ROLE DEV_ANALYST;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA DEV_CUSTOMER_DB.CORE TO ROLE DEV_ANALYST;
+GRANT SELECT ON FUTURE VIEWS IN SCHEMA DEV_CUSTOMER_DB.CORE TO ROLE DEV_ANALYST;
+
+GRANT ROLE DEV_LOADER TO ROLE DEV_TRANSFORMER;
+
+
+-- ===== 01_ingest_snowpipe.sql =====
+-- Landing table + Snowpipe auto-ingest from cloud storage.
+-- The storage integration is created once by an admin; no keys are stored here.
+
+CREATE FILE FORMAT IF NOT EXISTS DEV_CUSTOMER_DB.RAW.FF_JSON TYPE = JSON STRIP_OUTER_ARRAY = TRUE;
+
+CREATE STAGE IF NOT EXISTS DEV_CUSTOMER_DB.RAW.CUSTOMER_STAGE
+  URL = 's3://example-bucket/customer-changes/'
+  STORAGE_INTEGRATION = EXAMPLE_S3_INTEGRATION
+  FILE_FORMAT = DEV_CUSTOMER_DB.RAW.FF_JSON;
+
+CREATE TABLE IF NOT EXISTS DEV_CUSTOMER_DB.RAW.CUSTOMER_CHANGES (
+  customer_id   STRING,
+  name          STRING,
+  email_domain  STRING,
+  segment       STRING,
+  state         STRING,
+  change_ts     TIMESTAMP_NTZ,
+  _file_name    STRING,
+  _loaded_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE PIPE IF NOT EXISTS DEV_CUSTOMER_DB.RAW.CUSTOMER_PIPE AUTO_INGEST = TRUE AS
+  COPY INTO DEV_CUSTOMER_DB.RAW.CUSTOMER_CHANGES (customer_id, name, email_domain, segment, state, change_ts, _file_name)
+  FROM (
+    SELECT $1:customer_id::STRING, $1:name::STRING, $1:email_domain::STRING, $1:segment::STRING,
+           $1:state::STRING, $1:change_ts::TIMESTAMP_NTZ, METADATA$FILENAME
+    FROM @DEV_CUSTOMER_DB.RAW.CUSTOMER_STAGE
+  )
+  ON_ERROR = 'SKIP_FILE';
+
+
+-- ===== 02_core_objects.sql =====
+-- Change stream on the landing table and the SCD Type 2 dimension.
+
+CREATE STREAM IF NOT EXISTS DEV_CUSTOMER_DB.CORE.CUSTOMER_CHANGES_STREAM
+  ON TABLE DEV_CUSTOMER_DB.RAW.CUSTOMER_CHANGES APPEND_ONLY = TRUE;
+
+CREATE TABLE IF NOT EXISTS DEV_CUSTOMER_DB.CORE.DIM_CUSTOMER (
+  customer_sk   NUMBER AUTOINCREMENT,
+  customer_id   STRING NOT NULL,
+  name          STRING,
+  email_domain  STRING,
+  segment       STRING,
+  state         STRING,
+  row_hash      STRING,
+  valid_from    TIMESTAMP_NTZ,
+  valid_to      TIMESTAMP_NTZ,
+  is_current    BOOLEAN
+);
+
+-- Latest change per customer from the stream (handles several changes in one batch).
+CREATE OR REPLACE VIEW DEV_CUSTOMER_DB.CORE.V_CUSTOMER_CHANGES AS
+SELECT customer_id, name, email_domain, segment, state, change_ts,
+       MD5(CONCAT_WS('|', COALESCE(name, ''), COALESCE(email_domain, ''),
+                          COALESCE(segment, ''), COALESCE(state, ''))) AS row_hash
+FROM DEV_CUSTOMER_DB.CORE.CUSTOMER_CHANGES_STREAM
+QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY change_ts DESC) = 1;
+
+
+-- ===== 03_task.sql.j2 =====
+-- Task runs only when the stream has data; consuming the stream inside the
+-- transaction advances its offset, so each change is applied once.
+CREATE OR REPLACE TASK DEV_CUSTOMER_DB.CORE.APPLY_DIM_CUSTOMER
+  WAREHOUSE = DEV_TRANSFORM_WH
+  SCHEDULE = '5 MINUTE'
+  WHEN SYSTEM$STREAM_HAS_DATA('DEV_CUSTOMER_DB.CORE.CUSTOMER_CHANGES_STREAM')
+AS
+EXECUTE IMMEDIATE $$
+BEGIN
+  BEGIN TRANSACTION;
+  -- SCD Type 2 apply. Portable SQL: the same two statements run in Snowflake (inside the task)
+  -- and in DuckDB (unit tests). Target and source names are templated.
+  
+  -- 1) Expire current rows whose tracked attributes changed.
+  UPDATE DEV_CUSTOMER_DB.CORE.DIM_CUSTOMER d
+  SET is_current = FALSE, valid_to = c.change_ts
+  FROM DEV_CUSTOMER_DB.CORE.V_CUSTOMER_CHANGES c
+  WHERE d.customer_id = c.customer_id AND d.is_current AND d.row_hash <> c.row_hash;
+  
+  -- 2) Insert a new current version for new customers and for the rows expired above.
+  INSERT INTO DEV_CUSTOMER_DB.CORE.DIM_CUSTOMER (customer_id, name, email_domain, segment, state, row_hash, valid_from, valid_to, is_current)
+  SELECT c.customer_id, c.name, c.email_domain, c.segment, c.state, c.row_hash, c.change_ts, NULL, TRUE
+  FROM DEV_CUSTOMER_DB.CORE.V_CUSTOMER_CHANGES c
+  LEFT JOIN DEV_CUSTOMER_DB.CORE.DIM_CUSTOMER d ON d.customer_id = c.customer_id AND d.is_current
+  WHERE d.customer_id IS NULL;
+  
+  COMMIT;
+END;
+$$;
+
+ALTER TASK DEV_CUSTOMER_DB.CORE.APPLY_DIM_CUSTOMER RESUME;
+
+
