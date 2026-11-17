@@ -1,0 +1,16 @@
+-- Task runs only when the stream has data; consuming the stream inside the
+-- transaction advances its offset, so each change is applied once.
+CREATE OR REPLACE TASK {{database}}.CORE.APPLY_DIM_CUSTOMER
+  WAREHOUSE = {{warehouse}}
+  SCHEDULE = '{{task_schedule}}'
+  WHEN SYSTEM$STREAM_HAS_DATA('{{database}}.CORE.CUSTOMER_CHANGES_STREAM')
+AS
+EXECUTE IMMEDIATE $$
+BEGIN
+  BEGIN TRANSACTION;
+  {{scd2_apply}}
+  COMMIT;
+END;
+$$;
+
+ALTER TASK {{database}}.CORE.APPLY_DIM_CUSTOMER RESUME;
